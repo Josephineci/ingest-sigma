@@ -1,0 +1,49 @@
+---
+logging:
+  level: "debug"
+
+kafka_producer:
+  group_id: "dpn-ingest-local"
+  bootstrap_node: "127.0.0.1:9092"
+  ssl: false
+  queue_size: 1000
+
+registry:
+  uri: http://localhost:49051
+
+engine: "Kaiko"
+kaiko:
+  uri: https://gateway-v0-grpc.kaiko.ovh:443
+  key: 1234567890
+  kafka_topic_prefix: "candlestick"
+
+cboe:
+  kafka_topic_prefix: "trades"
+  eu_last_sale:
+    - bxe-ls-euw2:
+      topics:
+        - bxe-ls-euw2
+      bootstrap_node: 127.0.0.1:9092
+    - cxe-ls-euw2:
+      topics:
+        - cxe-ls-euw2
+      bootstrap_node: 127.0.0.1:9092
+    - dxe-ls-euw2:
+      topics:
+        - dxe-ls-euw2
+      bootstrap_node: 127.0.0.1:9092
+  us_top:
+    - edgx:
+      topics:
+        - edgx-tbc-euw2
+      bootstrap_node: 127.0.0.1:9092
+#  ssl:
+#    certificate: |
+#      -----BEGIN CERTIFICATE-----
+#      test
+#      -----END CERTIFICATE-----
+#    private_key: |
+#      -----BEGIN ENCRYPTED PRIVATE KEY-----
+#      test
+#      -----END ENCRYPTED PRIVATE KEY-----
+#    private_key_password: test

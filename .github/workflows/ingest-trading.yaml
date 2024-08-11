@@ -1,0 +1,191 @@
+on:
+    push:
+      branches:
+        - main
+        - production
+  
+  env:
+    ARGO_URL: ${{ secrets.ARGO_URL }}
+    ARGO_PASSWORD: ${{ secrets.ARGO_PASSWORD }}
+  
+  name: Deploy ingest-tradingtech to EKS
+  
+  jobs:
+    build-eks:
+      runs-on: self-hosted
+      if: "${{ startsWith(github.event.head_commit.message, 'chore(main): release') }}"
+      steps:
+        - name: Set Environment variables
+          run: |
+            echo "Detect Environment from Branch"
+            echo "github_ref ${{ github.ref }}"
+  
+            if [[ ${{ github.ref }} == "refs/heads/main" || ${{ github.ref }} == "refs/heads/master" ]]; then
+              echo "dev"
+              echo "action_state=dev" >> $GITHUB_ENV
+              echo "aws_id=${{ secrets.AWS_ACCESS_KEY_ID_DATA_DEV }}" >> $GITHUB_ENV
+              echo "aws_secret=${{ secrets.AWS_SECRET_ACCESS_KEY_DATA_DEV }}" >> $GITHUB_ENV
+            elif [[ ${{ github.ref }} == "refs/heads/staging" ]]; then
+              echo "stg"
+              echo "action_state=stg" >> $GITHUB_ENV
+              echo "aws_id=${{ secrets.AWS_ACCESS_KEY_ID_DATA_STG }}" >> $GITHUB_ENV
+              echo "aws_secret=${{ secrets.AWS_SECRET_ACCESS_KEY_DATA_STG }}" >> $GITHUB_ENV          
+            elif [[ ${{ github.ref }} == "refs/heads/production" ]]; then
+              echo "prd"
+              echo "action_state=prd" >> $GITHUB_ENV
+              echo "aws_id=${{ secrets.AWS_ACCESS_KEY_ID_DATA_PRD }}" >> $GITHUB_ENV
+              echo "aws_secret=${{ secrets.AWS_SECRET_ACCESS_KEY_DATA_PRD }}" >> $GITHUB_ENV
+            fi
+  
+        # Checkouts
+        - name: Use repository
+          uses: actions/checkout@v4
+        - name: Checkout sigma-services
+          uses: actions/checkout@v4
+          with:
+            repository: team-sigma-ai/sigma-services
+            ref: master
+            token: ${{ secrets.GH_PAT }}
+            path: sigma-services
+        - name: Checkout sigma-deploy
+          uses: actions/checkout@v4
+          with:
+            repository: team-sigma-ai/sigma-deploy
+            ref: master
+            token: ${{ secrets.GH_PAT }}
+            path: sigma-deploy
+        # Trading Tech .Net library
+        - name: Get latest release of TTAPIProxy
+          uses: robinraju/release-downloader@v1.9
+          with:
+            repository: "team-sigma-ai/ingest-tt-dotnet"
+            latest: true
+            fileName: "tt-proxy.tar.gz"
+            tarBall: false
+            zipBall: false
+            extract: false
+            token: ${{ secrets.GH_PAT }}
+        # Get Access to AWS
+        - name: Configure AWS credentials
+          uses: aws-actions/configure-aws-credentials@v4
+          with:
+            aws-access-key-id: ${{ env.aws_id }}
+            aws-secret-access-key: ${{ env.aws_secret }}
+            aws-region: eu-west-2
+        # Docker login into Amazon ECR to get common Rust Images
+        - name: Login to Amazon ECR sharedsvcs
+          id: login-ecr-sharedsvcs
+          uses: aws-actions/amazon-ecr-login@v2
+          with:
+            registries: "681030429768"
+            mask-password: "true"
+        # Push built images to Amazon ECR
+        - name: Login to Amazon ECR
+          id: login-ecr
+          uses: aws-actions/amazon-ecr-login@v2
+          with:
+            mask-password: "true"
+            
+         #Set up Docker Buildx with debug logging enabled
+        - name: Setup Docker Buildx
+          uses: docker/setup-buildx-action@v3
+          id: buildx
+          with:
+            buildkitd-flags: --debug
+     
+        # Build Images
+        - name: Build Stage 1
+          env:
+            DOCKER_FILE: docker/Dockerfile         
+            IMAGE_NAME: "${{ steps.login-ecr.outputs.registry }}/ingest-tradingtech-${{ env.action_state }}:${{ github.sha }}" 
+            GITHUB_REPOSITORY: team-sigma-ai/ingest-tradingtech
+            ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+            ECR_REPOSITORY: ingest-tradingtech
+            IMAGE_TAG: ${{ github.sha }}
+            ENVIRONMENT: ${{ env.action_state }}
+            GH_SSH: ${{ secrets.GH_SSH }}
+            DOCKER_BUILDKIT: 1
+          run: |
+            export GITHUB_REPOSITORY=team-sigma-ai/ingest-tradingtech
+            export ECR_REPOSITORY=ingest-tradingtech
+            bash sigma-deploy/github_actions/deploy_actions_$ENVIRONMENT.sh
+  
+        # Compile and push to ECR {ENVIRONMENT}
+        - name: Build Stage 2
+          env:
+            DOCKER_FILE: docker/Dockerfile-tt
+            BASE_IMAGE: "${{ steps.login-ecr.outputs.registry }}/ingest-tradingtech-${{ env.action_state }}:${{ github.sha }}"
+            GITHUB_REPOSITORY: team-sigma-ai/ingest-tradingtech
+            ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+            ECR_REPOSITORY: ingest-tradingtech
+            IMAGE_TAG: ${{ github.sha }}
+            ENVIRONMENT: ${{ env.action_state }}
+            GH_SSH: ${{ secrets.GH_SSH }}
+            DOCKER_BUILDKIT: 1
+          run: |
+            bash sigma-deploy/github_actions/deploy_actions_$ENVIRONMENT.sh
+            docker build . -f docker/Dockerfile-tt \
+             --build-arg BASE_IMAGE="$BASE_IMAGE" -t $ECR_REGISTRY/$ECR_REPOSITORY-$ENVIRONMENT:$IMAGE_TAG --pull
+        # Upload Argocd Artifacts
+        - name: Upload Argocd
+          uses: actions/upload-artifact@v4
+          with:
+            name: argocd-project
+            path: |
+              ${{ github.workspace }}/sigma-deploy
+  
+    deploy-eks:
+      needs: [build-eks]
+      runs-on: ubuntu-latest
+      if: "${{ startsWith(github.event.head_commit.message, 'chore(main): release') }}"
+      steps:
+        - name: Set Environment variables
+          run: |
+            echo "Detect Environment from Branch"
+            echo "github_ref ${{ github.ref }}"
+            if [[ ${{ github.ref }} == "refs/heads/main" || ${{ github.ref }} == "refs/heads/master" ]]; then
+              echo "dev"
+              echo "action_state=dev" >> $GITHUB_ENV
+              echo "aws_id=${{ secrets.AWS_ACCESS_KEY_ID_DATA_DEV }}" >> $GITHUB_ENV
+              echo "aws_secret=${{ secrets.AWS_SECRET_ACCESS_KEY_DATA_DEV }}" >> $GITHUB_ENV
+              echo "argo-repo=gitops" >> $GITHUB_ENV
+            elif [[ ${{ github.ref }} == "refs/heads/staging" ]]; then
+              echo "stg"
+              echo "action_state=stg" >> $GITHUB_ENV
+              echo "aws_id=${{ secrets.AWS_ACCESS_KEY_ID_DATA_STG }}" >> $GITHUB_ENV
+              echo "aws_secret=${{ secrets.AWS_SECRET_ACCESS_KEY_DATA_STG }}" >> $GITHUB_ENV
+              echo "argo-repo=gitops" >> $GITHUB_ENV
+            elif [[ ${{ github.ref }} == "refs/heads/production" ]]; then
+              echo "prd"
+              echo "action_state=prd" >> $GITHUB_ENV
+              echo "aws_id=${{ secrets.AWS_ACCESS_KEY_ID_DATA_PRD }}" >> $GITHUB_ENV
+              echo "aws_secret=${{ secrets.AWS_SECRET_ACCESS_KEY_DATA_PRD }}" >> $GITHUB_ENV
+              echo "argo-repo=gitops" >> $GITHUB_ENV
+            fi
+        # Download Artifacts
+        - name: Download Argocd
+          uses: actions/download-artifact@v4
+          with:
+            name: argocd-project
+            path: sigma-deploy
+        # Checkouts
+        - name: Checkout argo-deploy
+          uses: actions/checkout@v4
+          with:
+            repository: team-sigma-ai/${{ env.argo-repo }}
+            ref: master
+            token: ${{ secrets.GH_PAT }}
+            path: argo-deploy
+        # Publish Helm Chart
+        - name: Update Version and Helm Chart
+          env:
+            GITHUB_REPOSITORY: team-sigma-ai/ingest-tradingtech
+            ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+            ECR_REPOSITORY: ingest-tradingtech
+            IMAGE_TAG: ${{ github.sha }}
+            ENVIRONMENT: ${{ env.action_state }}
+          run: |
+            export GITHUB_REPOSITORY=team-sigma-ai/ingest-tradingtech
+            export ECR_REPOSITORY=ingest-tradingtech
+            bash sigma-deploy/github_actions/argocd.sh
+  
